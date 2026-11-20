@@ -1,5 +1,9 @@
 # AirSense backend + dashboard dependencies (Python 3.9+)
-paho-mqtt>=1.6.0,<3.0
+# paho-mqtt is pinned to the 1.x line on purpose: the service and dashboard
+# use the paho 1.6-style client/callback API. paho 2.x changed the Client
+# constructor (CallbackAPIVersion) and callback signatures and will NOT
+# work with this code.
+paho-mqtt>=1.6.0,<2.0
 pandas>=1.5
 numpy>=1.23
 plotly>=5.13
