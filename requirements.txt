@@ -1,0 +1,10 @@
+# AirSense backend + dashboard dependencies (Python 3.9+)
+paho-mqtt>=1.6.0,<3.0
+pandas>=1.5
+numpy>=1.23
+plotly>=5.13
+streamlit>=1.28
+python-dotenv>=1.0
+
+# testing
+pytest>=7.0

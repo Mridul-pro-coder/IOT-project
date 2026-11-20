@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Streamlit / data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets / local config
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Arduino build artifacts
+*.hex
+firmware/*/build/
+
+# Unrelated files that predate this project
+Group3_Solar-Aware_EV_Charging_Final_Report.pdf
