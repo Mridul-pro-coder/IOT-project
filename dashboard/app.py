@@ -193,14 +193,20 @@ def page_overview():
         st.subheader("Team risk (present users)")
         cols = st.columns(len(present))
         for i, u in enumerate(present):
-            lvl = (risks.get(u["id"]) or {}).get("level", "CLEAR")
+            r = risks.get(u["id"])
+            if r and "level" in r:
+                lvl = r["level"]
+                label = lvl
+                color = _level_color(lvl)
+            else:
+                lvl, label, color = "—", "not evaluated", "#9fb3d1"
             with cols[i]:
                 st.markdown(
-                    f"<div style='border:1px solid {_level_color(lvl)};"
+                    f"<div style='border:1px solid {color};"
                     f"border-radius:10px;padding:10px;text-align:center'>"
                     f"<div><b>{u['name']}</b></div>"
                     f"<div style='font-size:1.4rem'>"
-                    f"<span style='color:{_level_color(lvl)}'>{lvl}</span>"
+                    f"<span style='color:{color}'>{label}</span>"
                     f"</div>"
                     f"<div>≥{u['high_threshold']:.0f} = HIGH</div></div>",
                     unsafe_allow_html=True)
@@ -479,15 +485,25 @@ def page_team_risk():
     cols = st.columns(min(len(users), 4))
     for i, u in enumerate(users):
         r = risks.get(u["id"], {})
-        level = r.get("level") or "CLEAR"
         present = bool(u.get("present"))
+        evaluated = "level" in r          # a row exists only after an evaluation
+        level = r.get("level", "NOT EVALUATED")
         with cols[i % len(cols)]:
             card = ("🟢 " if present else "⚪ ") + u["name"]
             st.markdown(f"### {card}")
-            st.markdown(f"Risk: **<span style='color:{_level_color(level)}'>"
-                        f"{level.upper()}</span>**")
-            st.write(f"Last value: {r.get('last_value', '—')}  ·  "
-                    f"Source: {r.get('data_source', '—')}")
+            if evaluated:
+                st.markdown(
+                    f"Risk: "
+                    f"<span style='color:{_level_color(level)};font-size:1.3rem;"
+                    f"font-weight:600'>{level}</span>",
+                    unsafe_allow_html=True)
+                st.write(f"Last value: {r.get('last_value', '—')}  ·  "
+                         f"Source: {r.get('data_source', '—')}")
+            else:
+                st.markdown(
+                    "Risk: <span style='color:#9fb3d1'>not evaluated yet</span>",
+                    unsafe_allow_html=True)
+                st.caption("Waiting for telemetry to arrive.")
             open_for_user = [a for a in open_alerts if a["user_id"] == u["id"]]
             if open_for_user:
                 st.markdown(f"🚨 Open alert: **{open_for_user[0]['level']}**")
