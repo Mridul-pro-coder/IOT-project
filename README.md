@@ -277,7 +277,7 @@ Verify: no errors, it says it is listening on port 1883.
 
 ```bash
 # Make sure your venv is activated: you should see (.venv) in the prompt
-py -m backend.mqtt_service
+python -m backend.mqtt_service
 ```
 
 Verify output:
@@ -414,7 +414,7 @@ No broker or hardware needed. All tests run against an in-memory SQLite database
 
 ```bash
 # from the AirSense/ folder, venv activated
-py -m pytest tests -q
+python -m pytest tests -q
 ```
 
 Expected output: **37 passed**.
