@@ -1,376 +1,495 @@
 # 🌫️ AirSense
 
-**Air Quality-Linked Personalized Asthma Risk Prediction & Early Warning System** — an IoT environmental monitor with a physical ESP32 sensor, MQTT, a Python backend, and a multi-user personalized risk dashboard.
+**Air Quality-Linked Personalized Asthma Risk Prediction & Early Warning System**
 
-> ⚠️ **Scope & honesty.** This is a university IoT prototype, **not** a medical device. The MQ gas sensor produces **raw, uncalibrated ADC counts** — they are **not** ppm, **not** PM2.5, and **not** AQI. Predictions are **environmental trend forecasts** (time-to-threshold), not clinical asthma predictions. All personalization today is **rule-based thresholds**, not a learned model. The UI says all of this in the places that matter.
+A complete IoT pipeline: an ESP32 reads a gas sensor, publishes over MQTT, a Python backend stores it in SQLite and evaluates every user's personal risk thresholds, and a Streamlit dashboard shows live monitoring, predictive alerts, and multi-user risk — all in real time.
 
----
-
-## 1 · What the system does
-
-```
-   ┌────────────────┐      ┌──────────────────────────┐      ┌──────────────┐
-   │ MQ gas sensor  │ AO → │        ESP32 (Arduino)    │ Wi-Fi │   Mosquitto │
-   │ + shared buzzer├─────┤ median-N + EWMA + hysteresis├───→ │  (broker)   │
-   └────────────────┘      │ local offline buzzer       │      └──────┬─────┘
-                            └───────────────────────────┘             │
-   Buzzer policy:  local HIGH always arms the buzzer (offline-safe);  │
-                   backend's shared team command ORs onto it.        │
-                                                                     │
-                                                        ┌────────────┴───────────┐
-                                                        │  Python MQTT service   │
-                                                        │  (Paho + SQLite, WAL) │
-                                                        │  - stores telemetry   │
-                                                        │  - evaluates every    │
-                                                        │    PRESENT user's     │
-                                                        │    personal thresholds│
-                                                        │  - opens/touches/closes│
-                                                        │    deduplicated alerts│
-                                                        │  - publishes shared   │
-                                                        │    buzzer command     │
-                                                        └────────────┬───────────┘
-                                                                     │
-                                                        ┌────────────┴───────────┐
-                                                        │  SQLite data/airsense.db │
-                                                        └────────────┬───────────┘
-                                                                     │ reads
-                                                        ┌────────────┴───────────┐
-                                                        │  Streamlit dashboard    │
-                                                        │  (10 views + Plotly)    │
-                                                        └─────────────────────────┘
-```
-
-Two independent alert paths, by design:
-
-1. **Device-local (always works):** the ESP32 classifies its own reading and arms the buzzer on HIGH even with Wi-Fi off. This is the safety fallback.
-2. **Shared team policy (network):** the backend evaluates one reading against every present user's thresholds; if *any* present user is HIGH, it commands the buzzer on. The device **ORs** the two — the team command can only add to the local alert, never replace it.
+> ⚠️ **This is a university IoT prototype, not a certified medical device.**
+> The MQ gas sensor outputs **raw, uncalibrated ADC counts** — they are **not** ppm, **not** PM2.5, and **not** AQI.
+> Predictions are **environmental trend forecasts** (time-to-threshold crossing), not clinical asthma predictions.
+> All personalization is **rule-based thresholds** today — no ML model is trained or used.
 
 ---
 
-## 2 · Repository layout
+## Table of contents
 
-```
-.
-├── firmware/esp32_airsense/esp32_airsense.ino  # ESP32 Arduino firmware
-├── broker/mosquitto.conf                        # Mosquitto broker config
-├── backend/
-│   ├── config.py        # env-driven settings (broker host/port, thresholds)
-│   ├── database.py      # SQLite schema + read/write helpers (WAL)
-│   ├── migrations.py    # incremental schema migrations (never rewrites data)
-│   ├── mqtt_service.py  # Paho subscriber, validators, config + buzzer publisher
-│   ├── risk_engine.py   # per-user band classification (CLEAR/LOW/MODERATE/HIGH)
-│   ├── evaluation.py    # one reading -> all present users + alert dedup + buzzer
-│   ├── analytics.py     # rolling regression, time-to-threshold forecasts
-│   ├── ml_adapter.py    # modular seam for a FUTURE model (rule-based today)
-│   └── main.py
-├── dashboard/app.py     # Streamlit + Plotly app (10 views)
-├── tests/               # pytest (37 tests)
-├── requirements.txt     # Python deps (paho pinned to 1.x — see note)
-├── .env.example         # copy to .env and fill in
-└── data/airsense.db     # created at runtime (gitignored)
-```
+1. [What you get](#1-what-you-get)
+2. [Architecture at a glance](#2-architecture-at-a-glance)
+3. [Prerequisites](#3-prerequisites)
+4. [Clone the repo](#4-clone-the-repo)
+5. [Set up the Python backend](#5-set-up-the-python-backend)
+6. [Set up Mosquitto (MQTT broker)](#6-set-up-mosquitto-mqtt-broker)
+7. [Flash the ESP32 firmware](#7-flash-the-esp32-firmware)
+8. [Run the full system](#8-run-the-full-system)
+9. [Using the dashboard](#9-using-the-dashboard)
+10. [Demo checklist](#10-demo-checklist)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Project structure](#12-project-structure)
+13. [Tests](#13-tests)
+14. [Hardware notes & safety](#14-hardware-notes--safety)
 
 ---
 
-## 3 · One-time setup (Windows)
+## 1 · What you get
 
-Do these once; steps 4–7 are for every run.
+| Component | Role |
+|---|---|
+| **ESP32 firmware** | Reads the gas sensor, applies median-of-N + EWMA filtering, classifies exposure, drives a local buzzer, and publishes telemetry over MQTT. |
+| **Mosquitto broker** | Receives messages from the ESP32 and the dashboard; distributes them to the backend. |
+| **Python MQTT service** | Subscribes to all topics, validates every message, writes telemetry to SQLite, evaluates **every present user's personal thresholds** (different users can see different bands from the same reading), manages deduplicated alert episodes, and publishes shared buzzer commands. |
+| **Streamlit dashboard** | 10 views — live charts, predictive forecasts, per-user risk, exposure history with CSV export, symptom logs linked to sensor windows, device config push, and sensor provenance. |
+| **SQLite database** | Created automatically at `data/airsense.db`. Stores readings, user profiles, alert episodes, symptom logs, and calibration metadata. |
 
-### 3.1 Python + dependencies
+---
 
-```powershell
-# 1. Create a venv (Python 3.10+ recommended)
-py -3.11 -m venv .venv
+## 2 · Architecture at a glance
 
-# 2. Activate it
+```
+   ┌──────────────────┐        ┌──────────────────────────────────┐
+   │ MQ gas sensor    │  AO →  │  ESP32 (Arduino C++)              │
+   │ + shared buzzer  │        │  median-N + EWMA + hysteresis     │
+   └──────────────────┘        │  local offline buzzer (HIGH)      │
+                                │  Wi-Fi → MQTT (Mosquitto)         │
+                                └──────────────┬───────────────────┘
+      GPIO25  ◄─────── buzzer   team buzzer OR: local HIGH always arms;
+                                               backend policy ORs on top
+                                │        │
+                                │   ┌────┴──────────────────┐
+                                │   │ Mosquitto (broker)    │
+                                │   └────┬──────────────────┘
+                                │        │
+                                │   ┌────┴──────────────────┐
+                                │   │ Python MQTT service   │
+                                │   │ (Paho MQTT + SQLite)  │
+                                │   │                       │
+                                │   │ • stores telemetry    │
+                                │   │ • evaluates per-user  │
+                                │   │   risk bands          │
+                                │   │ • opens/touches/closes│
+                                │   │   deduplicated alerts │
+                                │   │ • publishes shared    │
+                                │   │   buzzer command      │
+                                │   └────┬──────────────────┘
+                                │        │
+                                │   ┌────┴──────────────────┐
+                                │   │ SQLite                │
+                                │   │ data/airsense.db      │
+                                │   └──────────────────────┘
+                                │        │ reads
+                                │   ┌────┴──────────────────┐
+                                │   │ Streamlit dashboard    │
+                                │   │ (10 views + Plotly)    │
+                                │   └──────────────────────┘
+```
+
+**Two independent alert paths, by design:**
+1. **Local (always works)** — the ESP32 classifies its own reading and arms the buzzer on HIGH, even with Wi-Fi off.
+2. **Shared team policy (needs network)** — the backend evaluates one reading against every present user's thresholds; if *any* present user is HIGH, it commands the buzzer on. The ESP32 ORs the two; the team command can only add to the local alert, never replace it.
+
+---
+
+## 3 · Prerequisites
+
+| Tool | Minimum version | How to get it |
+|---|---|---|
+| **Python** | 3.9 (3.10+ recommended) | [python.org/downloads](https://www.python.org/downloads/) — check "Add to PATH" |
+| **Arduino IDE** | 2.x | [arduino.cc/en/software](https://www.arduino.cc/en/software) |
+| **ESP32 board support** | espressif v2.x | Boards Manager in Arduino IDE → search `esp32` |
+| **Arduino libraries** | ArduinoJson v7, PubSubClient | Library Manager in Arduino IDE |
+| **Mosquitto** | any recent | [mosquitto.org/download](https://mosquitto.org/download/) (Windows zip) |
+| **Git** | any | [git-scm.com](https://git-scm.com/) |
+| **Windows Firewall exception** | — | Allow Mosquitto through on private networks |
+
+---
+
+## 4 · Clone the repo
+
+```bash
+git clone https://github.com/<your-org>/AirSense.git
+cd AirSense
+```
+
+If your team uses a different URL, use that. The `main` branch is the default.
+
+---
+
+## 5 · Set up the Python backend
+
+### 5.1 Create a virtual environment
+
+```bash
+# from the AirSense/ folder
+python -m venv .venv
+
+# Windows PowerShell
 .venv\Scripts\Activate.ps1
 
-# 3. Install dependencies
+# Windows Command Prompt
+.venv\Scripts\activate.bat
+```
+
+You should see `(.venv)` appear at the start of your prompt.
+
+### 5.2 Install dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-> `requirements.txt` pins `paho-mqtt` to the **1.x line** deliberately.
-> Paho 2.x changed the `Client` constructor and callback signatures and
-> will crash this code at startup. Do not "upgrade" it.
+> **Important:** `paho-mqtt` is pinned to **< 2.0** on purpose.
+> Paho 2.x (released 2024) changed the `Client` constructor and callback
+> signatures — this codebase uses the 1.6-style API and will crash at
+> startup with 2.x. Do not `pip install --upgrade paho-mqtt`.
 
-### 3.2 Mosquitto (the MQTT broker)
+### 5.3 Create your `.env` file
 
-Download the Windows build from <https://mosquitto.org/download/> and unzip
-to e.g. `C:\mosquitto`. Add `C:\mosquitto` to your `PATH` (or use the full
-path in the commands below). You need three tools: `mosquitto.exe`,
-`mosquitto_pub.exe`, `mosquitto_sub.exe`.
-
-No configuration is required to start — we ship a config for you in
-`broker/mosquitto.conf`.
-
-### 3.3 Arduino IDE + ESP32 firmware
-
-1. Install **Arduino IDE**.
-2. Boards Manager → search **"esp32" by espressif** → Install (or
-   "ESP32 by Espressif Systems").
-3. Library Manager → install **ArduinoJson** (v7.x — v6 will not compile)
-   and **PubSubClient**.
-4. Open `firmware\esp32_airsense\esp32_airsense.ino`.
-5. Fill in the edit-me block at the top of the `.ino`:
-   - `WIFI_SSID` / `WIFI_PASSWORD` — your Wi-Fi.
-   - `MQTT_BROKER` — **your laptop's LAN IP** (find with `ipconfig` →
-     IPv4 of your Wi-Fi adapter, usually `192.168.x.x`).
-     ⚠️ The ESP32 is a separate machine: it **cannot** use `localhost`.
-6. Leave `SENSOR_MODE_SIMULATED` as `true` until your voltage divider is
-   confirmed safe (see §9 Safety).
-
-### 3.4 Environment variables (optional but recommended)
-
-```powershell
-copy .env.example .env
-# edit .env: at minimum MQTT_HOST (usually "localhost" on the laptop)
+```bash
+copy .env.example .env   # Windows Command Prompt
+# or
+cp .env.example .env     # PowerShell / Git Bash
 ```
 
-`.env` is gitignored. You can also set these as real Windows environment
-variables instead — `backend/config.py` reads `os.environ` first.
+Edit `.env` and set at least:
+
+```
+MQTT_HOST=localhost
+MQTT_PORT=1883
+```
+
+Everything else has sensible defaults. The `.env` file is gitignored — your credentials never leave your machine.
 
 ---
 
-## 4 · Run everything (4 terminals)
+## 6 · Set up Mosquitto (MQTT broker)
 
-Run these in the order listed. Each box is one terminal.
+### 6.1 Install
+
+1. Download the Windows zip from <https://mosquitto.org/download/>
+2. Unzip to `C:\mosquitto` (or anywhere you like)
+3. Add `C:\mosquitto` to your system `PATH`:
+   - **PowerShell (admin):** `[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\mosquitto", "User")`
+   - Restart your terminal after this.
+
+### 6.2 Verify installation
+
+```bash
+mosquitto --version
+# Expected output, e.g.: mosquitto version 2.0.18
+```
+
+### 6.3 (Optional) Test that the broker starts and accepts connections
+
+```bash
+# Terminal A:
+mosquitto -c broker\mosquitto.conf
+
+# Terminal B (quick smoke test — close after you see "hello"):
+mosquitto_pub -h localhost -t airsense/group9/ping -m hello
+
+# Terminal C:
+mosquitto_sub -h localhost -t airsense/group9/ping
+# Should print: hello
+```
+
+Close Terminal B and C. Keep Terminal A open — the broker stays running there for the rest of the demo. If it's already running as a Windows service, skip starting it again.
+
+---
+
+## 7 · Flash the ESP32 firmware
+
+### 7.1 Prerequisites in Arduino IDE
+
+1. Open **Arduino IDE** → **File → Preferences** → Additional Boards Manager URLs → paste:
+   ```
+   https://dl.espressif.com/dl/package_esp32_index.json
+   ```
+2. **Tools → Board → Boards Manager** → search **"ESP32 by Espressif Systems"** → Install.
+3. **Sketch → Include Library → Manage Libraries** → install:
+   - **ArduinoJson** by Benoit Blanchon — **version 7.x** (v6 will not compile — the code uses `StaticJsonDocument` and `serializeJson()` from v7)
+   - **PubSubClient** by Nick O'Leary
+
+### 7.2 Configure the firmware
+
+Open `firmware/esp32_airsense/esp32_airsense.ino` in Arduino IDE.
+
+Find the **EDIT THESE** block near the top of the file and fill in:
+
+```cpp
+// ── Wi-Fi ──────────────────────────────────────────
+const char* WIFI_SSID     = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ── MQTT ───────────────────────────────────────────
+const char* DEVICE_ID     = "group9-esp32-01";     // any unique name
+const char* MQTT_BROKER   = "192.168.1.50";        // your LAPTOP's LAN IP
+                                                      // (NOT localhost or 127.0.0.1)
+const uint16_t MQTT_PORT  = 1883;
+```
+
+**How to find your laptop's LAN IP (Windows):**
+```powershell
+ipconfig
+```
+Look for "IPv4 Address" on your active Wi-Fi/Ethernet adapter (e.g. `192.168.1.50`). The ESP32 is a separate device on the same network — it cannot reach `localhost`.
+
+### 7.3 Keep simulated mode ON for now
+
+In the same block:
+```cpp
+#define SENSOR_MODE_SIMULATED true
+```
+
+Leave this `true` until you have confirmed the voltage divider is safe (see §14). Simulated mode means the firmware generates synthetic sensor readings so the whole pipeline can be proven without real hardware signals.
+
+### 7.4 Upload
+
+1. **Tools → Board → ESP32 Arduino → ESP32 Dev Module**
+2. **Tools → Port → (your COM port, e.g. COM3)**
+3. Click **Upload**.
+4. After upload finishes, open **Tools → Serial Monitor** and set the baud rate to **115200**.
+
+You should see:
+
+```
+[BOOT] AirSense firmware starting
+[WiFi] connected  IP=192.168.1.42
+[MQTT] connected and online status published
+[TELEMETRY] raw=72 filtered=72.0 level=LOW sim=1
+```
+
+If you see this, the ESP32 is live. Leave the serial monitor open.
+
+---
+
+## 8 · Run the full system
+
+You need **four things running** (four separate terminals).
 
 ### Terminal 1 — Mosquitto broker
 
-```powershell
+```bash
 mosquitto -c broker\mosquitto.conf
 ```
 
-**Verify:** no error output; the log says it is listening on port 1883.
-
-Smoke test the broker works:
-
-```powershell
-# in a scratch terminal:
-mosquitto_pub -h localhost -t "airsense/group9/ping" -m "hello"
-mosquitto_sub -h localhost -t "airsense/group9/ping"
-```
-
-You should see `hello` appear. Then close that scratch terminal.
+Verify: no errors, it says it is listening on port 1883.
 
 ### Terminal 2 — Python MQTT service
 
-```powershell
+```bash
+# Make sure your venv is activated: you should see (.venv) in the prompt
 py -m backend.mqtt_service
 ```
 
-**Verify:** it prints
-
+Verify output:
 ```
 [mqtt] connected to localhost:1883; subscribing to airsense/group9/#
 [mqtt] service running. Ctrl+C to stop.
 ```
 
-If it says "connection failed / retrying," the broker isn't running or
-`MQTT_HOST`/`MQTT_PORT` are wrong. This service keeps retrying, so you can
-fix the broker without restarting it.
+This service keeps retrying if the broker is unreachable, so if you see connection retries, the broker isn't running yet or `MQTT_HOST` is wrong.
 
 ### Terminal 3 — Streamlit dashboard
 
-```powershell
+```bash
 streamlit run dashboard/app.py
 ```
 
-**Verify:** browser opens `http://localhost:8501`. The **Overview** page
-shows the device as 🔴 offline and "no data yet" — correct, no ESP32 is
-publishing yet.
+A browser tab opens at `http://localhost:8501`. The **Overview** page should show 🔴 offline and "no data yet" — correct, the ESP32 hasn't published yet.
 
-### Terminal 4 (optional) — live topic watch
+### Terminal 4 — ESP32 serial monitor
 
-```powershell
+Already open from §7.4. Verify you see `[TELEMETRY]` lines every 2 seconds.
+
+### Terminal 5 (optional) — Live topic watcher
+
+```bash
 mosquitto_sub -h localhost -p 1883 -t "airsense/group9/#" -v
 ```
 
-Leave this open; every JSON message from the ESP32 and the backend's buzzer
-commands will stream by here.
-
-### Terminal 5 — Flash & run the ESP32
-
-In Arduino IDE: board **ESP32 Dev Module**, correct COM port, then **Upload**.
-Open **Serial Monitor @ 115200** after the upload finishes.
-
-**Verify (in order):**
-
-```
-[WiFi] connected  IP=...
-[MQTT] connected and online status published
-[TELEMETRY] raw=... filtered=... level=LOW sim=1
-```
-
-Within a few seconds:
-- Terminal 4 shows the `telemetry` JSON every ~2 s.
-- Terminal 2 prints `[person] HIGH: ...` lines when the simulated reading
-  crosses a user's HIGH band, and `[buzzer] shared policy -> on` after it.
-- The dashboard's **Overview** shows 🟢 online, a moving **Live Monitoring**
-  chart, and the **Team Risk** strip filling in per-user bands.
-- The ESP32's buzzer sounds when its own reading hits HIGH *or* when the
-  team command arrives.
-
-That's the whole system running. From here on, Ctrl+C any of the four
-terminals and restart it — the schema and data persist in `data/airsense.db`.
+Every JSON message from the ESP32 and the backend's buzzer commands streams here. Leave it open during the demo.
 
 ---
 
-## 5 · Using the multi-user dashboard
+## 9 · Using the dashboard
 
-The 10 sidebar views:
+The sidebar has **10 views**:
 
-| View | What it does |
+| View | What you see |
 |---|---|
-| **Overview** | Device status, current reading, buzzer, and a live per-user risk strip. |
-| **Team Risk** | Every present user's band side by side, shared-buzzer state, personalized alert history. |
-| **Live Monitoring** | Filtered-vs-raw chart with threshold lines + level band; last 20 rows. |
-| **Predictive Analytics** | Rolling-regression trend, time-to-HIGH estimate, fixed vs predictive vs personalized signals. |
-| **Personalized Profiles** | The original named threshold sets (Sensitive/Standard/Relaxed); create more. |
-| **Exposure History** | Hourly look-back chart, per-band duration, events, **CSV export**. |
-| **Symptom Feedback** | The original free-form symptom log (unlinked). |
-| **User Symptom Logs** | Per-user symptom entries **linked to a sensor window** (count/min/mean/max + real-vs-simulated source). |
-| **Users** | Create / edit / delete users, their LOW-MODERATE-HIGH thresholds + hysteresis, and **mark present/absent**. |
-| **Device Settings** | Device status, push device config over MQTT, sensor provenance, model status. |
+| **Overview** | Current reading, device online/offline status, buzzer state, Wi-Fi signal, and a per-user risk strip for present users. |
+| **Team Risk** | Every present user's risk band side by side (HIGH = red, MODERATE = orange, LOW = yellow, CLEAR = green), shared buzzer policy state, and personalized alert history. |
+| **Live Monitoring** | Filtered vs raw ADC readings over time, threshold lines, and the exposure level as a color band. |
+| **Predictive Analytics** | Rolling linear-regression trend, time-to-threshold forecast, and a comparison of fixed vs predictive vs personalized early-warning signals. |
+| **Personalized Profiles** | Named threshold sets (e.g. Sensitive, Standard, Relaxed) and the EWMA smoothing factor. |
+| **Exposure History** | Hourly look-back chart, total time in each band, warning events, and a **CSV export** button. |
+| **Symptom Feedback** | Free-form symptom/irritation log (unlinked to a sensor window). |
+| **User Symptom Logs** | Per-user symptom entries **linked to a sensor window** — each log stores the count/min/mean/max of readings over the look-back period, plus whether the data was simulated or real. |
+| **Users** | Create / edit / delete users with their personal LOW-MODERATE-HIGH thresholds and hysteresis, and mark them present or absent. |
+| **Device Settings** | Device status, push threshold config to the ESP32 over MQTT (validated before sending), sensor provenance (real vs simulated), and personalization model status. |
 
-### Worked example
+### Quick multi-user demo
 
-1. **Users** → mark *Aarav (sensitive)* **present** and *Standard user* **absent**.
-2. **Team Risk** now shows only Aarav. When the simulated reading climbs
-   past 130 (his HIGH band), his card turns red, a 🚨 open alert appears,
-   and the shared-buzzer box says **ON**.
-3. Keep the reading above his band: the alert row is *touched*, not
-   duplicated (check **Alert history** — one `HIGH` episode, moving
-   `last_seen`).
-4. Reading falls below 120 (his HIGH − 2·hysteresis): the alert **closes**
-   with a `closed_at` timestamp, buzzer command goes `off`.
-5. **User Symptom Logs** → log "mild cough" for Aarav with a 15-minute
-   look-back; the stored log carries the window's mean/max and whether it
-   was simulated data.
-6. **Exposure History** → **Download CSV** for the presentation.
-
-### Why "not evaluated yet"
-
-Per-user risk rows are only written when the MQTT service processes a real
-telemetry message. Before the first message, Team Risk cards say
-*"not evaluated yet"* — deliberately, so a blank state is never mistaken
-for an "all clear."
+1. Go to **Users** → create two users: *Aarav (sensitive)* with thresholds LOW=80, MODERATE=100, HIGH=130, and *Priya (standard)* with LOW=100, MODERATE=120, HIGH=180.
+2. Mark both **present**.
+3. Go to **Team Risk** — both show "not evaluated yet" because no reading has been processed.
+4. Wait for the simulated readings to climb (the firmware ramps every 30 s). When the filtered value crosses 130, Aarav's card turns 🔴 red and shows HIGH, while Priya may still be MODERATE or LOW — same reading, different thresholds, different result.
+5. Check **Exposure History** → **Download CSV** for the presentation.
+6. Go to **User Symptom Logs** → log a symptom for Aarav with a 15-minute look-back — it stores the sensor window's statistics alongside the note.
 
 ---
 
-## 6 · How the personalization actually works
+## 10 · Demo checklist
 
-- One ESP32 reading (the `filtered_adc` value) is broadcast to
-  `evaluation.evaluate_reading()` on every telemetry message.
-- It classifies **each present user** against that user's own
-  LOW/MODERATE/HIGH thresholds with hysteresis (entry at `threshold − h`,
-  exit at `threshold − 2h`, one band change per reading), so the *same*
-  reading can be HIGH for one user and MODERATE for another. That is
-  requirement 12, and `tests/test_multi_user.py::test_same_reading_different_warnings_per_user`
-  proves it.
-- Alerts are **episodes**, not rows-per-reading: entering MODERATE/HIGH
-  opens one row; staying there touches it; dropping below exits it. No
-  notification spam during an ongoing event.
-- The **shared buzzer command** goes to `airsense/group9/cmd/buzzer`. The
-  ESP32 ORs it with its own local HIGH detection and ignores the team
-  command if it is > 15 s old or MQTT is down — the local fallback is
-  always authoritative for safety.
-- **ML**: `backend/ml_adapter.py` defines a `Personalizer` protocol and a
-  `RuleBasedPredictor` (the only active one today). The `user_calibration`
-  table is reserved for a future trained model. Until a trained model and
-  its evaluation evidence exist on disk, the system *refuses* to describe
-  itself as learned or as transfer learning.
+Run through all 8 to confirm the system is fully operational:
+
+- [ ] **ESP32 publishing** — Terminal 4 shows `[TELEMETRY]` every ~2 s, Terminal 5 shows the JSON topic stream.
+- [ ] **Dashboard live** — **Live Monitoring** chart moves without manual refresh.
+- [ ] **Local buzzer** — simulated ramp crosses HIGH → ESP32 buzzer sounds.
+- [ ] **Shared buzzer** — a HIGH reading for any present user → backend sends buzzer command → dashboard **Team Risk** shows "Buzzer ON".
+- [ ] **Different thresholds = different warnings** — same reading, two users, different bands on **Team Risk**.
+- [ ] **Reconnect** — unplug the ESP32 (or stop Mosquitto), then restore. Device reconnects, data resumes, LWT disconnection is logged.
+- [ ] **Offline local alert** — stop the Python service (Ctrl+C Terminal 2). The ESP32 still buzzes on its own HIGH (team policy is dead, local fallback is alive).
+- [ ] **CSV export** — **Exposure History** → Download CSV opens in Excel.
 
 ---
 
-## 7 · Automated tests
-
-```powershell
-py -m pytest tests -q
-```
-
-37 tests, no broker or hardware needed:
-
-- `test_analytics.py` — trend/forecast safeguards
-- `test_database.py` — schema + round-trips
-- `test_validation.py` — device-config guard rails
-- `test_multi_user.py` — one reading → different warnings per user,
-  alert dedup, presence gating, hysteresis, shared-buzzer policy,
-  provenance, symptom-window stats
-- `test_ml_adapter.py` — the "no transfer learning" guarantee
-
----
-
-## 8 · Troubleshooting
+## 11 · Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `mosquitto` won't start, "address in use" | Port 1883 taken. `mosquitto -c broker\mosquitto.conf -p 1884`, then set `MQTT_PORT=1884` in `.env` and the ESP32's `MQTT_PORT`. |
-| Service prints connection retries forever | Broker down, or `MQTT_HOST` wrong. The service is `localhost`; the ESP32 is your laptop's **LAN IP**. |
-| ESP32 Wi-Fi connects but MQTT fails | `MQTT_BROKER` set to `localhost` or `127.0.0.1` on the device — it must be the laptop's LAN IP. Also check Windows Firewall: allow Mosquitto through on private networks. |
-| Serial monitor shows garbage | Open it *after* the upload completes; some boards reset on open. Set 115200 exactly. |
-| Firmware build error `unknown type 'StaticJsonDocument'` | You have ArduinoJson v6. Install **v7.x**. |
-| `TypeError ... paho` at service start | Paho 2.x got installed. `pip install "paho-mqtt<2"` (see §3.1 note). |
-| Dashboard shows "no data yet" after all 4 terminals run | The ESP32 isn't publishing yet. Check Terminal 4 — do `telemetry` lines appear? If not, check its serial monitor for `[MQTT] connected`. |
-| Team Risk cards say "not evaluated yet" | No telemetry has been processed yet, or no user is marked present. Either is fine — it is *not* an "all clear." |
-| Buzzer never sounds in sim mode | Simulated readings cross HIGH on a 30 s cycle; wait for one. Or the team policy OR failed: check `[BUZZER-CMD]` lines on the serial monitor. |
-| SQLite "locked" errors | Should not happen (WAL mode, short-lived connections). If you see them, a stale process has the DB open — close all streamlit/service terminals and restart. |
+| `mosquitto` says "address in use" | Port 1883 is taken. Start with a different port: `mosquitto -c broker\mosquitto.conf -p 1884`, then set `MQTT_PORT=1884` in `.env` and update the ESP32's `MQTT_PORT` to match. |
+| Service prints connection retries | Broker is not running, or `MQTT_HOST` is wrong. The Python service uses `localhost`; the ESP32 uses your **laptop's LAN IP** — they are different. |
+| ESP32 Wi-Fi connects but MQTT fails | `MQTT_BROKER` is set to `localhost` or `127.0.0.1` in the firmware — it must be the laptop's LAN IP. Also check Windows Firewall: allow Mosquitto through on private networks. |
+| Serial monitor shows garbage | Open it *after* the upload finishes — some boards reset when the serial port opens. Confirm baud rate is 115200. |
+| Arduino build: `'StaticJsonDocument' was not declared` | You have **ArduinoJson v6**. Remove it from your libraries and install **v7.x** (Library Manager → search "ArduinoJson" → select the latest). |
+| Service crashes: `TypeError: ... paho ...` | Paho 2.x got installed. Run `pip install "paho-mqtt<2.0"` and retry. |
+| Dashboard shows "no data yet" after everything is running | The ESP32 isn't publishing. Check Terminal 5 — do `telemetry` lines appear? If not, check the serial monitor for `[MQTT] connected` and `[WiFi] connected`. |
+| Team Risk cards say "not evaluated yet" | Normal if no telemetry has arrived yet, or if no user is marked present. This means *"nothing evaluated yet"* — it is **not** an "all clear" indication. |
+| Buzzer never sounds | Simulated readings cycle on a ~30 s ramp; wait for one. Or the team command failed — check the ESP32 serial monitor for `[BUZZER-CMD]` lines. |
+| SQLite "database is locked" | Should not happen (WAL mode, short-lived connections). If it does, a stale process has the DB open — stop all terminals and restart. |
 
 ---
 
-## 9 · Hardware safety notes
+## 12 · Project structure
 
-- **GPIO34 is 3.3 V and ADC-only.** Do **not** wire the MQ sensor's 5 V
-  `AO` straight to it. Use a voltage divider that keeps the signal
-  **< 3.3 V** at the pin (e.g. 2 kΩ + 3.3 kΩ gives ≈ 0.625× — a 5 V rail
-  reading would be halved, which also explains why your observed ~76–77
-  counts are a small slice of the 0–4095 range). Re-tune thresholds to
-  your *divided* baseline, not the module's undivided one.
-- **Buzzer on GPIO25** — confirmed active-high, direct drive. If it draws
-  > ~20 mA, put an NPN transistor between the GPIO and the buzzer; the
-  firmware's `BUZZER_ACTIVE_HIGH` flag stays as-is.
-- **Simulated mode is the default** (`SENSOR_MODE_SIMULATED true`) so the
-  whole pipeline can be proven before the real sensor is wired. Flip it to
-  `false` only after the divider is verified with a multimeter.
-- **Calibration:** none. Never report these numbers as ppm, PM2.5, or AQI.
+```
+AirSense/
+├── firmware/
+│   └── esp32_airsense/
+│       └── esp32_airsense.ino          # ESP32 Arduino firmware
+├── broker/
+│   └── mosquitto.conf                  # Mosquitto broker config
+├── backend/
+│   ├── __init__.py
+│   ├── config.py                       # env-driven settings
+│   ├── database.py                     # SQLite schema + CRUD (WAL mode)
+│   ├── migrations.py                   # incremental schema migrations
+│   ├── mqtt_service.py                 # Paho subscriber, validators, publishers
+│   ├── risk_engine.py                  # per-user band classification (CLEAR/LOW/MODERATE/HIGH)
+│   ├── evaluation.py                   # one reading → all present users + alerts + buzzer
+│   ├── analytics.py                    # rolling regression, time-to-threshold
+│   ├── ml_adapter.py                   # modular seam for a FUTURE model
+│   └── main.py
+├── dashboard/
+│   └── app.py                          # Streamlit + Plotly (10 views)
+├── tests/
+│   ├── test_analytics.py
+│   ├── test_database.py
+│   ├── test_validation.py
+│   ├── test_multi_user.py              # one reading → different warnings per user
+│   └── test_ml_adapter.py
+├── data/
+│   └── airsense.db                     # created at runtime (gitignored)
+├── .env.example                        # copy to .env and fill in
+├── requirements.txt                    # Python deps (paho<2)
+├── .gitignore
+└── README.md                           # you are here
+```
 
 ---
 
-## 10 · Demo-day checklist (the 8-point demonstration)
+## 13 · Tests
 
-With the 4 terminals + ESP32 running (§4):
+No broker or hardware needed. All tests run against an in-memory SQLite database.
 
-1. ☐ ESP32 telemetry visible in Terminal 4 (`telemetry` topic, every ~2 s).
-2. ☐ Dashboard **Live Monitoring** chart moves without manual refresh.
-3. ☐ Simulated ramp crosses a user's HIGH → buzzer sounds + 🚨 on
-   **Team Risk** + `[buzzer] shared policy -> on` in Terminal 2.
-4. ☐ Two users with different thresholds: same reading → different bands
-   (show it in **Team Risk**).
-5. ☐ Unplug the ESP32's Wi-Fi (or its power) → dashboard flips 🔴,
-   `lastwill` logged. Reconnect → auto-reconnects, data resumes.
-6. ☐ Local-only proof: with the *backend service stopped* (Ctrl+C
-   Terminal 2), the ESP32 still buzzes on its own HIGH — the shared policy
-   is dead but the local fallback is not.
-7. ☐ **Exposure History** → CSV export works.
-8. ☐ **User Symptom Logs** → log a symptom, see its stored sensor window
-   (mean/min/max + source) against the chart.
+```bash
+# from the AirSense/ folder, venv activated
+py -m pytest tests -q
+```
+
+Expected output: **37 passed**.
+
+| Test file | What it covers |
+|---|---|
+| `test_database.py` | Schema creation, telemetry CRUD, user CRUD, migrations, WAL mode |
+| `test_validation.py` | Device config guard rails (rejects invalid thresholds) |
+| `test_analytics.py` | Trend/forecast with insufficient-data and noisy-data safeguards |
+| `test_multi_user.py` | **Key proof:** one reading → HIGH for one user, MODERATE for another. Plus alert dedup, presence gating, hysteresis stability, shared-buzzer policy, and sensor provenance. |
+| `test_ml_adapter.py` | The rule-based predictor is NOT described as trained or transfer-learning. The reserved `user_calibration` table will not produce a false "learned model" claim. |
 
 ---
 
-## 11 · Configuration reference
+## 14 · Hardware notes & safety
 
-`.env` (or real env vars) — all optional, shown with defaults:
+### Wiring
 
-| Variable | Default | Meaning |
+| ESP32 pin | Connection | Notes |
 |---|---|---|
-| `MQTT_HOST` | `localhost` | Broker host for the Python side |
-| `MQTT_PORT` | `1883` | Broker port |
-| `MQTT_USER` / `MQTT_PASSWORD` | *(empty)* | Set both if the broker has auth |
-| `MQTT_TOPIC_PREFIX` | `airsense/group9/` | Topic namespace |
-| `DEVICE_OFFLINE_TTL` | `30` | Seconds before the dashboard calls the device offline |
-| `DEFAULT_MODERATE` / `DEFAULT_HIGH` | `100` / `150` | Device-standard thresholds (uncalibrated ADC) |
-| `AIRSENSE_DATA_DIR` / `AIRSENSE_DB` | `./data` / `./data/airsense.db` | Where SQLite lives |
+| GPIO34 (ADC-only) | MQ sensor AO via **voltage divider** | GPIO34 is **3.3 V ADC only**. Do **not** connect a 5 V sensor output directly. Use a divider (e.g. 2 kΩ + 3.3 kΩ) to keep the pin signal **< 3.3 V**. |
+| GPIO25 | Buzzer | Active-high, direct-drive confirmed for typical 5 V buzzers. If the buzzer draws > ~20 mA, add an NPN transistor between GPIO25 and the buzzer. |
+| 5 V (VIN) | MQ sensor VCC | Per the module's own specification. |
+| GND | MQ sensor GND + buzzer GND | Common ground required. |
 
-Firmware edit-me block (`esp32_airsense.ino` top): `WIFI_SSID`,
-`WIFI_PASSWORD`, `MQTT_BROKER` (laptop LAN IP), `DEVICE_ID`, and the
-`SENSOR_MODE_SIMULATED` switch.
+### Voltage divider math
+
+Your preliminary baseline is ~76–77 ADC counts with the sensor at rest. With a 2 kΩ / 3.3 kΩ divider on a 5 V rail, the division ratio is ~0.625 — a 5 V signal becomes ~3.125 V at the pin. This converts to ~389 ADC counts at 5 V (4095 × 3.125 / 3.3). Your observed 76–77 counts likely reflects the sensor's actual output voltage in clean air, divided down. **Retune thresholds after wiring** — set the baseline in simulated mode first, then switch to real and recalibrate.
+
+### Simulated mode
+
+The firmware ships with `SENSOR_MODE_SIMULATED true`. The service and dashboard treat simulated and real data the same way — the only difference is the `simulation: 1` flag in every JSON message, and the database logs the data source in `sensor_config` for provenance. Flip the flag to `false` in the firmware only after the voltage divider is confirmed safe with a multimeter.
+
+### Calibration
+
+There is **no calibration**. The raw ADC values are never converted to ppm, PM2.5, or AQI. The dashboard, the firmware, and this README all state that explicitly.
+
+---
+
+## 15 · Configuration reference
+
+### Backend `.env`
+
+All variables are optional. Copy `.env.example` to `.env` in the project root.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MQTT_HOST` | `localhost` | Broker host (Python side) |
+| `MQTT_PORT` | `1883` | Broker port |
+| `MQTT_USER` / `MQTT_PASSWORD` | *(empty)* | Set both if the broker requires authentication |
+| `MQTT_TOPIC_PREFIX` | `airsense/group9/` | MQTT topic namespace |
+| `DEVICE_OFFLINE_TTL` | `30` | Seconds before the dashboard considers the device offline |
+| `DEFAULT_MODERATE` | `100` | Device-standard MODERATE threshold (uncalibrated ADC) |
+| `DEFAULT_HIGH` | `150` | Device-standard HIGH threshold (uncalibrated ADC) |
+| `AIRSENSE_DATA_DIR` | `./data` | Directory for the SQLite database |
+| `AIRSENSE_DB` | `./data/airsense.db` | Full path to the database file |
+
+### Firmware edit block (`esp32_airsense.ino`, top of file)
+
+| Variable | Description |
+|---|---|
+| `WIFI_SSID` | Your Wi-Fi network name |
+| `WIFI_PASSWORD` | Your Wi-Fi password |
+| `DEVICE_ID` | Unique device name (e.g. `group9-esp32-01`) |
+| `MQTT_BROKER` | Your **laptop's LAN IP** (not `localhost`) |
+| `MQTT_PORT` | Broker port (usually 1883) |
+| `SENSOR_MODE_SIMULATED` | `true` = synthetic readings, `false` = real sensor |
+
+### MQTT topics
+
+| Topic | Direction | Content |
+|---|---|---|
+| `airsense/group9/telemetry` | ESP32 → backend | JSON: raw_adc, filtered_adc, exposure level, buzzer state, simulation flag, uptime |
+| `airsense/group9/status` | ESP32 → backend | Online/offline status updates |
+| `airsense/group9/alerts` | ESP32 → backend | Exposure level change events (band transitions) |
+| `airsense/group9/config` | Dashboard → ESP32 | Threshold config (validated before sending; device rejects invalid values) |
+| `airsense/group9/cmd/buzzer` | Backend → ESP32 | Shared team buzzer policy command |
+| `airsense/group9/lwt` | Broker → backend | Last Will and Testament — fires when the ESP32 disconnects unexpectedly |
